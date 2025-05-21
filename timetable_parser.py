@@ -55,13 +55,15 @@ def get_groups_data():
         logger.error(f"Error fetching groups data: {e}")
         return []
 
-def parse_timetable(group_id, start_date=None, end_date=None):
+# BEGIN CHANGES: Enhanced timetable parser with optional retries and improved error handling
+def parse_timetable(group_id, start_date=None, end_date=None, max_retries=3):
     """
     Парсит расписание для указанной группы на указанный период с использованием POST запроса
 
     :param group_id: ID группы (параметр vr)
     :param start_date: начальная дата в формате DD.MM.YYYY (по умолчанию - текущая дата)
     :param end_date: конечная дата в формате DD.MM.YYYY (по умолчанию - +14 дней)
+    :param max_retries: максимальное количество попыток запроса при ошибках
     :return: список занятий
     """
     try:
@@ -98,14 +100,31 @@ def parse_timetable(group_id, start_date=None, end_date=None):
 
         logger.info(f"Sending POST request to {url} for group {group_id} from {start_date} to {end_date}")
 
-        # Отправляем POST запрос
-        response = requests.post(url, data=data, headers=headers)
+        # Попытки отправить запрос с повторами при ошибках
+        response = None
+        retry_count = 0
 
-        logger.info(f"Response status code: {response.status_code}")
+        while retry_count < max_retries:
+            try:
+                # Отправляем POST запрос
+                response = requests.post(url, data=data, headers=headers, timeout=30)
 
-        if response.status_code != 200:
-            logger.error(f"Failed to get timetable: HTTP {response.status_code}")
-            logger.error(f"Response content: {response.text[:500]}...")
+                if response.status_code == 200:
+                    break
+
+                logger.warning(f"Request failed with status {response.status_code}, retrying ({retry_count+1}/{max_retries})")
+                retry_count += 1
+                time.sleep(2)  # Пауза между повторами
+
+            except (requests.exceptions.RequestException, requests.exceptions.Timeout) as e:
+                logger.warning(f"Request error: {e}, retrying ({retry_count+1}/{max_retries})")
+                retry_count += 1
+                time.sleep(2)  # Пауза между повторами
+
+        if not response or response.status_code != 200:
+            logger.error(f"Failed to get timetable after {max_retries} attempts: HTTP {response.status_code if response else 'No response'}")
+            if response:
+                logger.error(f"Response content: {response.text[:500]}...")
             return []
 
         # Проверка наличия таблицы расписания в ответе
@@ -204,3 +223,4 @@ def parse_timetable(group_id, start_date=None, end_date=None):
         import traceback
         logger.error(traceback.format_exc())
         return []
+# END CHANGES

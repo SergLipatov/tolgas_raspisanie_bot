@@ -94,6 +94,64 @@ class Database:
         )
         ''')
 
+        # BEGIN CHANGES: Added new tables for enhanced functionality
+
+        # Таблица настроек периода обновления для групп
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS update_period_settings (
+            id INTEGER PRIMARY KEY,
+            group_id INTEGER UNIQUE NOT NULL,
+            days INTEGER DEFAULT 30,
+            FOREIGN KEY (group_id) REFERENCES groups (group_id)
+        )
+        ''')
+
+        # Таблица ежедневных уведомлений
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_notifications (
+            id INTEGER PRIMARY KEY,
+            subscription_id INTEGER UNIQUE NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            notify_before_minutes INTEGER DEFAULT 60,
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions (id)
+        )
+        ''')
+
+        # Таблица уведомлений о парах после "окон"
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS gap_notifications (
+            id INTEGER PRIMARY KEY,
+            subscription_id INTEGER UNIQUE NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            notify_before_minutes INTEGER DEFAULT 30,
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions (id)
+        )
+        ''')
+
+        # Таблица уведомлений о конкретных предметах
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS subject_notifications (
+            id INTEGER PRIMARY KEY,
+            subscription_id INTEGER NOT NULL,
+            subject_pattern TEXT NOT NULL,
+            notify_before_minutes INTEGER DEFAULT 30,
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions (id)
+        )
+        ''')
+
+        # Таблица уведомлений о конкретных преподавателях
+        self.cursor.execute('''
+        CREATE TABLE IF NOT EXISTS teacher_notifications (
+            id INTEGER PRIMARY KEY,
+            subscription_id INTEGER NOT NULL,
+            teacher_pattern TEXT NOT NULL,
+            notify_before_minutes INTEGER DEFAULT 30,
+            FOREIGN KEY (subscription_id) REFERENCES subscriptions (id)
+        )
+        ''')
+
+        # END CHANGES
+
         self.conn.commit()
 
     def add_group(self, name, group_id):
@@ -280,6 +338,27 @@ class Database:
                 "INSERT OR IGNORE INTO notification_settings (subscription_id) VALUES (?)",
                 (subscription_id,)
             )
+
+            # BEGIN CHANGES: Added default notification settings for new types
+            # Добавляем настройки ежедневных уведомлений
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO daily_notifications (subscription_id) VALUES (?)",
+                (subscription_id,)
+            )
+
+            # Добавляем настройки уведомлений о парах после "окон"
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO gap_notifications (subscription_id) VALUES (?)",
+                (subscription_id,)
+            )
+
+            # Установим период обновления по умолчанию
+            self.cursor.execute(
+                "INSERT OR IGNORE INTO update_period_settings (group_id, days) VALUES (?, ?)",
+                (group_id, 30)  # 30 дней по умолчанию
+            )
+            # END CHANGES
+
             self.conn.commit()
 
             logger.info(f"User {user_id} subscribed to group {group_id}")
@@ -308,7 +387,33 @@ class Database:
 
             subscription_id = result[0]
 
-            # Удаляем настройки уведомлений
+            # BEGIN CHANGES: Remove all notification settings
+            # Удаляем настройки уведомлений по предметам
+            self.cursor.execute(
+                "DELETE FROM subject_notifications WHERE subscription_id = ?",
+                (subscription_id,)
+            )
+
+            # Удаляем настройки уведомлений по преподавателям
+            self.cursor.execute(
+                "DELETE FROM teacher_notifications WHERE subscription_id = ?",
+                (subscription_id,)
+            )
+
+            # Удаляем настройки уведомлений о парах после "окон"
+            self.cursor.execute(
+                "DELETE FROM gap_notifications WHERE subscription_id = ?",
+                (subscription_id,)
+            )
+
+            # Удаляем настройки ежедневных уведомлений
+            self.cursor.execute(
+                "DELETE FROM daily_notifications WHERE subscription_id = ?",
+                (subscription_id,)
+            )
+            # END CHANGES
+
+            # Удаляем стандартные настройки уведомлений
             self.cursor.execute(
                 "DELETE FROM notification_settings WHERE subscription_id = ?",
                 (subscription_id,)
@@ -428,8 +533,9 @@ class Database:
             logger.error(f"Error getting upcoming lessons: {e}")
             return []
 
+    # BEGIN CHANGES: Updated notification functions for enhanced functionality
     def get_users_to_notify(self, group_id, lesson_datetime):
-        """Получает список пользователей для уведомления о конкретном занятии"""
+        """Получает список пользователей для уведомления о конкретном занятии (общие уведомления)"""
         try:
             self.cursor.execute(
                 """
@@ -445,6 +551,181 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting users to notify: {e}")
             return []
+
+    def get_daily_notifications_to_send(self, date_str):
+        """Получает список пользователей для ежедневных уведомлений на указанную дату"""
+        try:
+            self.cursor.execute(
+                """
+                SELECT 
+                    u.telegram_id, 
+                    dn.notify_before_minutes,
+                    MIN(l.time_start) as first_lesson,
+                    g.name,
+                    g.group_id
+                FROM daily_notifications dn
+                JOIN subscriptions s ON dn.subscription_id = s.id
+                JOIN users u ON s.user_id = u.id
+                JOIN groups g ON s.group_id = g.group_id
+                JOIN lessons l ON s.group_id = l.group_id AND l.date = ?
+                WHERE dn.enabled = 1
+                GROUP BY u.telegram_id, g.group_id
+                """,
+                (date_str,)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting daily notifications to send: {e}")
+            return []
+
+    def get_gap_notifications_to_send(self):
+        """Получает список пар после "окон" для уведомлений"""
+        try:
+            today = datetime.now().strftime('%d.%m.%Y')
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime('%d.%m.%Y')
+
+            self.cursor.execute(
+                """
+                WITH LessonGaps AS (
+                    SELECT 
+                        l1.group_id,
+                        l1.date,
+                        l1.time_start,
+                        l1.number,
+                        CAST(l1.number AS INTEGER) - CAST(MAX(l2.number) AS INTEGER) AS gap
+                    FROM lessons l1
+                    LEFT JOIN lessons l2 ON 
+                        l1.group_id = l2.group_id AND 
+                        l1.date = l2.date AND
+                        CAST(l2.number AS INTEGER) < CAST(l1.number AS INTEGER)
+                    WHERE 
+                        l1.date IN (?, ?) 
+                    GROUP BY 
+                        l1.group_id, l1.date, l1.number, l1.time_start
+                    HAVING 
+                        gap > 1 OR (gap = 1 AND (JULIANDAY(l1.time_start) - JULIANDAY(MAX(l2.time_end))) * 24 * 60 >= 40)
+                )
+                SELECT 
+                    u.telegram_id,
+                    gn.notify_before_minutes,
+                    l.date,
+                    l.time_start,
+                    l.date, l.number, l.time_start, l.time_end, 
+                    l.subject, l.lesson_type, l.audience, l.teacher, g.name
+                FROM gap_notifications gn
+                JOIN subscriptions s ON gn.subscription_id = s.id
+                JOIN users u ON s.user_id = u.id
+                JOIN groups g ON s.group_id = g.group_id
+                JOIN LessonGaps lg ON s.group_id = lg.group_id
+                JOIN lessons l ON 
+                    l.group_id = lg.group_id AND 
+                    l.date = lg.date AND 
+                    l.number = lg.number
+                WHERE 
+                    gn.enabled = 1
+                """,
+                (today, tomorrow)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting gap notifications to send: {e}")
+            return []
+
+    def get_subject_notifications_to_send(self):
+        """Получает список предметов для уведомлений"""
+        try:
+            today = datetime.now().strftime('%d.%m.%Y')
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime('%d.%m.%Y')
+
+            self.cursor.execute(
+                """
+                SELECT 
+                    u.telegram_id,
+                    sn.notify_before_minutes,
+                    l.date,
+                    l.time_start,
+                    sn.subject_pattern,
+                    l.date, l.number, l.time_start, l.time_end, 
+                    l.subject, l.lesson_type, l.audience, l.teacher, g.name
+                FROM subject_notifications sn
+                JOIN subscriptions s ON sn.subscription_id = s.id
+                JOIN users u ON s.user_id = u.id
+                JOIN groups g ON s.group_id = g.group_id
+                JOIN lessons l ON s.group_id = l.group_id
+                WHERE 
+                    l.date IN (?, ?) AND
+                    lower(l.subject) LIKE '%' || lower(sn.subject_pattern) || '%'
+                """,
+                (today, tomorrow)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting subject notifications to send: {e}")
+            return []
+
+    def get_teacher_notifications_to_send(self):
+        """Получает список преподавателей для уведомлений"""
+        try:
+            today = datetime.now().strftime('%d.%m.%Y')
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime('%d.%m.%Y')
+
+            self.cursor.execute(
+                """
+                SELECT 
+                    u.telegram_id,
+                    tn.notify_before_minutes,
+                    l.date,
+                    l.time_start,
+                    tn.teacher_pattern,
+                    l.date, l.number, l.time_start, l.time_end, 
+                    l.subject, l.lesson_type, l.audience, l.teacher, g.name
+                FROM teacher_notifications tn
+                JOIN subscriptions s ON tn.subscription_id = s.id
+                JOIN users u ON s.user_id = u.id
+                JOIN groups g ON s.group_id = g.group_id
+                JOIN lessons l ON s.group_id = l.group_id
+                WHERE 
+                    l.date IN (?, ?) AND
+                    lower(l.teacher) LIKE '%' || lower(tn.teacher_pattern) || '%'
+                """,
+                (today, tomorrow)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting teacher notifications to send: {e}")
+            return []
+
+    def get_general_lesson_notifications_to_send(self):
+        """Получает список общих уведомлений о занятиях"""
+        try:
+            today = datetime.now().strftime('%d.%m.%Y')
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime('%d.%m.%Y')
+
+            self.cursor.execute(
+                """
+                SELECT 
+                    u.telegram_id,
+                    ns.notify_before_minutes,
+                    l.date,
+                    l.time_start,
+                    l.date, l.number, l.time_start, l.time_end, 
+                    l.subject, l.lesson_type, l.audience, l.teacher, g.name
+                FROM notification_settings ns
+                JOIN subscriptions s ON ns.subscription_id = s.id
+                JOIN users u ON s.user_id = u.id
+                JOIN groups g ON s.group_id = g.group_id
+                JOIN lessons l ON s.group_id = l.group_id
+                WHERE 
+                    s.notifications_enabled = 1 AND
+                    l.date IN (?, ?)
+                """,
+                (today, tomorrow)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting general lesson notifications to send: {e}")
+            return []
+    # END CHANGES
 
     def update_notification_settings(self, telegram_id, group_id, notify_before_minutes):
         """Обновляет настройки уведомлений для подписки"""
@@ -487,6 +768,249 @@ class Database:
         except Exception as e:
             logger.error(f"Error toggling notifications: {e}")
             return False
+
+    # BEGIN CHANGES: Added new functions for enhanced functionality
+    def update_daily_notification_settings(self, telegram_id, group_id, notify_before_minutes):
+        """Обновляет настройки ежедневных уведомлений"""
+        try:
+            self.cursor.execute(
+                """
+                UPDATE daily_notifications
+                SET notify_before_minutes = ?
+                WHERE subscription_id IN (
+                    SELECT s.id FROM subscriptions s
+                    JOIN users u ON s.user_id = u.id
+                    WHERE u.telegram_id = ? AND s.group_id = ?
+                )
+                """,
+                (notify_before_minutes, telegram_id, group_id)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating daily notification settings: {e}")
+            return False
+
+    def toggle_daily_notifications(self, telegram_id, group_id, enabled):
+        """Включает или выключает ежедневные уведомления"""
+        try:
+            self.cursor.execute(
+                """
+                UPDATE daily_notifications
+                SET enabled = ?
+                WHERE subscription_id IN (
+                    SELECT s.id FROM subscriptions s
+                    JOIN users u ON s.user_id = u.id
+                    WHERE u.telegram_id = ? AND s.group_id = ?
+                )
+                """,
+                (1 if enabled else 0, telegram_id, group_id)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error toggling daily notifications: {e}")
+            return False
+
+    def update_gap_notification_settings(self, telegram_id, group_id, notify_before_minutes):
+        """Обновляет настройки уведомлений о парах после "окон" """
+        try:
+            self.cursor.execute(
+                """
+                UPDATE gap_notifications
+                SET notify_before_minutes = ?
+                WHERE subscription_id IN (
+                    SELECT s.id FROM subscriptions s
+                    JOIN users u ON s.user_id = u.id
+                    WHERE u.telegram_id = ? AND s.group_id = ?
+                )
+                """,
+                (notify_before_minutes, telegram_id, group_id)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error updating gap notification settings: {e}")
+            return False
+
+    def toggle_gap_notifications(self, telegram_id, group_id, enabled):
+        """Включает или выключает уведомления о парах после "окон" """
+        try:
+            self.cursor.execute(
+                """
+                UPDATE gap_notifications
+                SET enabled = ?
+                WHERE subscription_id IN (
+                    SELECT s.id FROM subscriptions s
+                    JOIN users u ON s.user_id = u.id
+                    WHERE u.telegram_id = ? AND s.group_id = ?
+                )
+                """,
+                (1 if enabled else 0, telegram_id, group_id)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error toggling gap notifications: {e}")
+            return False
+
+    def add_subject_notification(self, telegram_id, group_id, subject_pattern):
+        """Добавляет уведомление о конкретном предмете"""
+        try:
+            # Получаем ID подписки
+            self.cursor.execute(
+                """
+                SELECT s.id FROM subscriptions s
+                JOIN users u ON s.user_id = u.id
+                WHERE u.telegram_id = ? AND s.group_id = ?
+                """,
+                (telegram_id, group_id)
+            )
+            result = self.cursor.fetchone()
+
+            if not result:
+                logger.warning(f"Subscription not found for user {telegram_id} and group {group_id}")
+                return False
+
+            subscription_id = result[0]
+
+            self.cursor.execute(
+                """
+                INSERT INTO subject_notifications (subscription_id, subject_pattern)
+                VALUES (?, ?)
+                """,
+                (subscription_id, subject_pattern)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding subject notification: {e}")
+            return False
+
+    def add_teacher_notification(self, telegram_id, group_id, teacher_pattern):
+        """Добавляет уведомление о конкретном преподавателе"""
+        try:
+            # Получаем ID подписки
+            self.cursor.execute(
+                """
+                SELECT s.id FROM subscriptions s
+                JOIN users u ON s.user_id = u.id
+                WHERE u.telegram_id = ? AND s.group_id = ?
+                """,
+                (telegram_id, group_id)
+            )
+            result = self.cursor.fetchone()
+
+            if not result:
+                logger.warning(f"Subscription not found for user {telegram_id} and group {group_id}")
+                return False
+
+            subscription_id = result[0]
+
+            self.cursor.execute(
+                """
+                INSERT INTO teacher_notifications (subscription_id, teacher_pattern)
+                VALUES (?, ?)
+                """,
+                (subscription_id, teacher_pattern)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding teacher notification: {e}")
+            return False
+
+    def set_update_period_for_group(self, group_id, days):
+        """Устанавливает период обновления расписания для группы"""
+        try:
+            self.cursor.execute(
+                """
+                INSERT INTO update_period_settings (group_id, days)
+                VALUES (?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                days = excluded.days
+                """,
+                (group_id, days)
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting update period for group {group_id}: {e}")
+            return False
+
+    def get_update_period_for_group(self, group_id):
+        """Получает период обновления расписания для группы"""
+        try:
+            self.cursor.execute(
+                """
+                SELECT days FROM update_period_settings
+                WHERE group_id = ?
+                """,
+                (group_id,)
+            )
+            result = self.cursor.fetchone()
+
+            if result:
+                return result[0]
+            else:
+                # По умолчанию 30 дней
+                self.set_update_period_for_group(group_id, 30)
+                return 30
+        except Exception as e:
+            logger.error(f"Error getting update period for group {group_id}: {e}")
+            return 30
+
+    def find_teacher_lessons(self, teacher_name):
+        """Ищет занятия конкретного преподавателя на ближайшие 5 дней"""
+        try:
+            today = datetime.now().strftime('%d.%m.%Y')
+            end_date = (datetime.now() + timedelta(days=5)).strftime('%d.%m.%Y')
+
+            self.cursor.execute(
+                """
+                SELECT 
+                    l.date, l.number, l.time_start, l.time_end, 
+                    l.subject, l.lesson_type, l.audience, l.teacher, g.name
+                FROM lessons l
+                JOIN groups g ON l.group_id = g.group_id
+                WHERE 
+                    lower(l.teacher) LIKE '%' || lower(?) || '%' AND
+                    l.date >= ? AND l.date <= ? AND
+                    l.teacher != ''
+                ORDER BY l.date, l.time_start
+                """,
+                (teacher_name, today, end_date)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error finding teacher's lessons: {e}")
+            return []
+
+    def find_room_lessons(self, room_number):
+        """Ищет занятия в конкретной аудитории на ближайшие 5 дней"""
+        try:
+            today = datetime.now().strftime('%d.%m.%Y')
+            end_date = (datetime.now() + timedelta(days=5)).strftime('%d.%m.%Y')
+
+            self.cursor.execute(
+                """
+                SELECT 
+                    l.date, l.number, l.time_start, l.time_end, 
+                    l.subject, l.lesson_type, l.audience, l.teacher, g.name
+                FROM lessons l
+                JOIN groups g ON l.group_id = g.group_id
+                WHERE 
+                    lower(l.audience) LIKE '%' || lower(?) || '%' AND
+                    l.date >= ? AND l.date <= ?
+                ORDER BY l.date, l.time_start
+                """,
+                (room_number, today, end_date)
+            )
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error finding room's lessons: {e}")
+            return []
+    # END CHANGES
 
     def save_update_info(self, entity_type, entity_id=None, next_update=None):
         """Сохраняет информацию о последнем обновлении и запланированном следующем обновлении
